@@ -11,10 +11,12 @@ export async function GET(
   const { filePath } = await params;
   try {
     // Catch-all params arrive as an array when intermediate proxies decode
-    // %2F to /; join before validating so `startsWith` works correctly.
-    const decodedFilePath = Array.isArray(filePath)
+    // %2F to /. Always prepend `/` if missing — Modal's proxy 308-redirects
+    // can strip the leading slash before Next.js sees the URL.
+    const rawFilePath = Array.isArray(filePath)
       ? filePath.map(decodeURIComponent).join('/')
       : decodeURIComponent(filePath);
+    const decodedFilePath = rawFilePath.startsWith('/') ? rawFilePath : '/' + rawFilePath;
 
     // Get allowed directories
     const datasetRoot = await getDatasetsRoot();
