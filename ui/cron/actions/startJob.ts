@@ -113,10 +113,17 @@ const startAndWatchJob = (job: Job) => {
           stdio: 'ignore', // don't tie stdio to parent
         });
       } else {
-        // For non-Windows platforms, fully detach and ignore stdio so it survives daemon-like
+        // On Modal/gVisor: `stdio:'ignore'` + `detached:true` kills the
+        // Python child within seconds (process spawns, then dies without a
+        // trace — likely gVisor's handling of /dev/null under a detached
+        // session). Redirecting stdio to concrete file descriptors avoids
+        // the crash AND captures any Python startup errors to the same log
+        // the UI tails.
+        const stdoutFd = fs.openSync(logPath, 'a');
+        const stderrFd = fs.openSync(logPath, 'a');
         subprocess = spawn(pythonPath, args, {
           detached: true,
-          stdio: 'ignore',
+          stdio: ['ignore', stdoutFd, stderrFd],
           env: {
             ...process.env,
             ...additionalEnv,

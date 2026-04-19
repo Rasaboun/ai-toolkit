@@ -28,11 +28,20 @@ const contentTypeMap: { [key: string]: string } = {
   '.ogg': 'audio/ogg',
 };
 
-export async function GET(request: NextRequest, { params }: { params: { imagePath: string } }) {
+export async function GET(
+  request: NextRequest,
+  { params }: { params: Promise<{ imagePath: string | string[] }> },
+) {
   const { imagePath } = await params;
   try {
-    // Decode the path
-    const filepath = decodeURIComponent(imagePath);
+    // Catch-all `[...imagePath]` gives an array when Modal's proxy decodes
+    // %2F to real slashes (external requests) and a string when the encoded
+    // form reaches Next.js intact (internal localhost requests). Handle
+    // both: join array segments back into a single path so `filepath`
+    // always starts with the real `/root/...` prefix.
+    const filepath = Array.isArray(imagePath)
+      ? imagePath.map(decodeURIComponent).join('/')
+      : decodeURIComponent(imagePath);
 
     // Get allowed directories
     const datasetRoot = await getDatasetsRoot();

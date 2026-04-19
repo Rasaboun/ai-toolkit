@@ -4,11 +4,17 @@ import fs from 'fs';
 import path from 'path';
 import { getDatasetsRoot, getTrainingFolder } from '@/server/settings';
 
-export async function GET(request: NextRequest, { params }: { params: { filePath: string } }) {
+export async function GET(
+  request: NextRequest,
+  { params }: { params: Promise<{ filePath: string | string[] }> },
+) {
   const { filePath } = await params;
   try {
-    // Decode the path
-    const decodedFilePath = decodeURIComponent(filePath);
+    // Catch-all params arrive as an array when intermediate proxies decode
+    // %2F to /; join before validating so `startsWith` works correctly.
+    const decodedFilePath = Array.isArray(filePath)
+      ? filePath.map(decodeURIComponent).join('/')
+      : decodeURIComponent(filePath);
 
     // Get allowed directories
     const datasetRoot = await getDatasetsRoot();

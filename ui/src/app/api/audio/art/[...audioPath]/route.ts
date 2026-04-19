@@ -125,10 +125,15 @@ function extractArtFromTag(buf: Buffer): ArtResult {
   return null;
 }
 
-export async function GET(request: NextRequest, { params }: { params: { audioPath: string } }) {
+export async function GET(
+  request: NextRequest,
+  { params }: { params: Promise<{ audioPath: string | string[] }> },
+) {
   const { audioPath } = await params;
   try {
-    const filepath = decodeURIComponent(audioPath);
+    const filepath = Array.isArray(audioPath)
+      ? audioPath.map(decodeURIComponent).join('/')
+      : decodeURIComponent(audioPath);
 
     // Security check
     const datasetRoot = await getDatasetsRoot();
