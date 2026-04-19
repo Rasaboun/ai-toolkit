@@ -131,9 +131,10 @@ export async function GET(
 ) {
   const { audioPath } = await params;
   try {
-    const filepath = Array.isArray(audioPath)
+    const rawAudioPath = Array.isArray(audioPath)
       ? audioPath.map(decodeURIComponent).join('/')
       : decodeURIComponent(audioPath);
+    const filepath = rawAudioPath.startsWith('/') ? rawAudioPath : '/' + rawAudioPath;
 
     // Security check
     const datasetRoot = await getDatasetsRoot();

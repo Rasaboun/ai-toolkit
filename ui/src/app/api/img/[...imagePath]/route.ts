@@ -35,13 +35,14 @@ export async function GET(
   const { imagePath } = await params;
   try {
     // Catch-all `[...imagePath]` gives an array when Modal's proxy decodes
-    // %2F to real slashes (external requests) and a string when the encoded
-    // form reaches Next.js intact (internal localhost requests). Handle
-    // both: join array segments back into a single path so `filepath`
-    // always starts with the real `/root/...` prefix.
-    const filepath = Array.isArray(imagePath)
+    // %2F to real slashes — sometimes via a 308 redirect that also strips
+    // the leading slash, leaving us with `['app', 'ai-toolkit', ...]`
+    // instead of `['', 'app', 'ai-toolkit', ...]`. Always prepend `/` if
+    // the joined result is missing it, so `startsWith('/app/...')` works.
+    const rawPath = Array.isArray(imagePath)
       ? imagePath.map(decodeURIComponent).join('/')
       : decodeURIComponent(imagePath);
+    const filepath = rawPath.startsWith('/') ? rawPath : '/' + rawPath;
 
     // Get allowed directories
     const datasetRoot = await getDatasetsRoot();
