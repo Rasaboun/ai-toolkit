@@ -3,12 +3,9 @@ from PIL import Image
 
 from toolkit.config_modules import LoggingConfig
 import os
-import random
 import re
 import sqlite3
-import string
 import time
-import uuid
 
 
 # Base logger class
@@ -191,6 +188,21 @@ class MLflowLogger(EmptyLogger):
 
         self._started = True
 
+        # Save full config as artifact for reproducibility
+        try:
+            import tempfile
+            import oyaml as yaml
+
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".yaml", prefix="training_config_", delete=False
+            ) as f:
+                yaml.dump(dict(self.config), f, default_flow_style=False)
+                config_path = f.name
+            mlflow.log_artifact(config_path, artifact_path="config")
+            os.remove(config_path)
+        except Exception as e:
+            print(f"[MLflowLogger] Warning: failed to log config artifact: {e}")
+
         # Log flattened config as params for comparison
         flat_params = self._flatten_config(self.config)
         if flat_params:
@@ -268,19 +280,11 @@ class MLflowLogger(EmptyLogger):
         if step is None:
             step = self._last_step if self._last_step is not None else 0
         try:
-            # Step-aligned images for the Image Grid chart in Model Metrics.
-            # We build the artifact path manually using '+' as the separator
-            # instead of relying on mlflow.log_image(key=, step=) because
-            # MLflow <= 3.10.1 uses '%' which breaks URL encoding for certain
-            # step numbers (e.g. step 23 → '%23' → '#'). Fixed on master via
-            # mlflow/mlflow#21269 but not yet in a stable release.
-            # The JS parser (ImageReducer.ts) already supports both '+' and '%'.
-            ts = int(time.time() * 1000)
-            file_uuid = f"{random.choice(string.ascii_lowercase[6:])}{str(uuid.uuid4())[1:]}"
-            safe_key = str(id).replace("/", "#")
-
-            base = f"images/{safe_key}+step+{step}+timestamp+{ts}+{file_uuid}"
-            self._mlflow.log_image(image, artifact_file=f"{base}.png")
+            # Use the key/step API so MLflow creates both .png and compressed .webp
+            # (required by the Image Grid chart and Images comparison view).
+            # MLflow >= 3.11 uses '+' as separator, avoiding the URL encoding bug
+            # from mlflow/mlflow#21269.
+            self._mlflow.log_image(image, key=str(id), step=step)
 
             if not self._logged_images_tag_set and self._run:
                 self._mlflow.set_tag("mlflow.loggedImages", "true")
@@ -701,6 +705,23 @@ def create_logger(
     save_root: Optional[str] = None,
 ):
     loggers: List[EmptyLogger] = []
+
+    # Auto-enable MLflow from env vars when the job config doesn't set it —
+    # makes ai-toolkit's UI-generated YAML transparently log to the shared
+    # MLflow server without requiring a UI-side change. Set at the container
+    # level in deploy_modal_web_ui.py.
+    _env_mlflow_uri = os.environ.get("MLFLOW_TRACKING_URI")
+    if _env_mlflow_uri and not logging_config.use_mlflow:
+        logging_config.use_mlflow = True
+        if not logging_config.mlflow_tracking_uri:
+            logging_config.mlflow_tracking_uri = _env_mlflow_uri
+        if not logging_config.mlflow_experiment_name:
+            logging_config.mlflow_experiment_name = os.environ.get(
+                "MLFLOW_EXPERIMENT_NAME", "aitk-ui-default"
+            )
+        # Artifact upload defaults to true so checkpoints + sample images
+        # land in the shared MLflow server.
+        logging_config.mlflow_log_artifacts = True
 
     if logging_config.use_wandb:
         loggers.append(
