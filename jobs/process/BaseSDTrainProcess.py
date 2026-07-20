@@ -12,6 +12,8 @@ from typing import Union, List, Optional
 
 import numpy as np
 import yaml
+from PIL import Image, ImageOps
+from torchvision import transforms
 from diffusers import T2IAdapter, ControlNetModel
 from diffusers.training_utils import compute_density_for_timestep_sampling
 from safetensors.torch import save_file, load_file
@@ -40,6 +42,7 @@ from toolkit.network_mixins import Network
 from toolkit.optimizer import get_optimizer
 from toolkit.paths import CONFIG_ROOT
 from toolkit.progress_bar import ToolkitProgressBar
+from toolkit.prompt_utils import concat_prompt_embeds
 from toolkit.reference_adapter import ReferenceAdapter
 from toolkit.sampler import get_sampler
 from toolkit.saving import save_t2i_from_diffusers, load_t2i_model, save_ip_adapter_from_diffusers, \
@@ -47,7 +50,7 @@ from toolkit.saving import save_t2i_from_diffusers, load_t2i_model, save_ip_adap
 
 from toolkit.scheduler import get_lr_scheduler
 from toolkit.sd_device_states_presets import get_train_sd_device_state_preset
-from toolkit.stable_diffusion_model import StableDiffusion
+from toolkit.stable_diffusion_model import StableDiffusion, BlankNetwork
 
 from jobs.process import BaseTrainProcess
 from toolkit.metadata import get_meta_for_safetensors, load_metadata_from_safetensors, add_base_model_info_to_meta, \
@@ -260,6 +263,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.current_boundary_index = 0
         self.steps_this_boundary = 0
         self.num_consecutive_oom = 0
+        self.additional_logs = {}
+        # cached latents, prompt embeds, and fixed noise for validation
+        self._validation_cache = None
 
     def post_process_generate_image_config_list(self, generate_image_config_list: List[GenerateImageConfig]):
         # override in subclass
@@ -370,6 +376,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         if self.ema is not None:
             self.ema.train()
+        print_acc("") # add a line break
 
     def update_training_metadata(self):
         o_dict = OrderedDict({
@@ -626,18 +633,26 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     )
         else:
             if self.network is not None and self.train_config.merge_network_on_save:
-                # merge the network weights into a full model and save that
-                if not self.network.can_merge_in:
+                # merge the network weights into a full model and save that.
+                # torchao quantized weights can be force merged here (dequantize -> merge -> re-quantize)
+                # even though can_merge_in is False (kept False so sampling never merges). quanto and
+                # layer_offloading still cannot merge.
+                from toolkit.util.quantize import get_torchao_config
+                can_force_quantized_merge = (
+                    self.model_config.quantize and not self.model_config.layer_offloading
+                    and get_torchao_config(self.model_config.qtype) is not None
+                )
+                if not self.network.can_merge_in and not can_force_quantized_merge:
                     raise ValueError("Network cannot merge in weights. Cannot save full model.")
-                
+
                 print_acc("Merging network weights into full model for saving...")
-                
+
                 self.network.merge_in(merge_weight=self.train_config.merge_network_on_save_strength)
                 # reset weights to zero
                 self.network.reset_weights()
                 self.network.is_merged_in = False
                 
-                print_acc("Done merging network weights.")
+                print_acc("Done merging network weights. Saving model...")
                 
             if self.save_config.save_format == "diffusers":
                 # saving as a folder path
@@ -801,7 +816,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
     def hook_after_sd_init_before_load(self):
         pass
 
-    def get_latest_save_path(self, name=None, post=''):
+    def get_latest_save_path(self, name=None, post='', include_pretrained_lora=True):
         if name == None:
             name = self.job.name
         # get latest saved step
@@ -834,7 +849,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if len(paths) > 0:
                     latest_path = max(paths, key=os.path.getctime)
         
-        if latest_path is None and self.network_config is not None and self.network_config.pretrained_lora_path is not None:
+        if include_pretrained_lora and latest_path is None and self.network_config is not None and self.network_config.pretrained_lora_path is not None:
             # set pretrained lora path as load path if we do not have a checkpoint to resume from
             if os.path.exists(self.network_config.pretrained_lora_path):
                 latest_path = self.network_config.pretrained_lora_path
@@ -1567,6 +1582,146 @@ class BaseSDTrainProcess(BaseTrainProcess):
             self.load_training_state_from_metadata(latest_save_path)
         # set trainable params
         self.sd.adapter = self.adapter
+    
+    def setup_validation(self):
+        # caches everything needed for validation (latents, prompt embeds, fixed noise)
+        # must be called while the vae and text encoder are still loaded, they may be
+        # dumped later to save memory
+        val_config = self.train_config.validation_config
+        if val_config is None:
+            return
+        if not self.accelerator.is_main_process:
+            return
+        validation_items = []
+        for item in val_config.validation_items:
+            if not item.image_path:
+                print_acc("Skipping validation item with no image")
+                continue
+            if not os.path.exists(item.image_path):
+                print_acc(f"Skipping validation item, image not found: {item.image_path}")
+                continue
+            validation_items.append(item)
+        if len(validation_items) == 0:
+            print_acc("Validation config has no valid validation_items, skipping validation")
+            return
+        print_acc(f"Caching validation latents and embeddings for {len(validation_items)} images")
+        device = self.device_torch
+        dtype = get_torch_dtype(self.train_config.dtype)
+        resolution = val_config.resolution
+
+        image_list = []
+        prompt_list = []
+        for item in validation_items:
+            img = Image.open(item.image_path)
+            img = ImageOps.exif_transpose(img).convert('RGB')
+            # deterministic resize, shortest side to resolution then center crop
+            img = transforms.Resize(resolution)(img)
+            img = transforms.CenterCrop(resolution)(img)
+            tensor = transforms.ToTensor()(img) * 2.0 - 1.0
+            image_list.append(tensor)
+            prompt_list.append(item.prompt)
+
+        fork_devices = [device] if device.type == 'cuda' else []
+        with torch.no_grad(), torch.random.fork_rng(devices=fork_devices):
+            # encode the prompts one at a time so they can be reassembled per sigma later
+            te = self.sd.text_encoder
+            te_list = te if isinstance(te, list) else ([te] if te is not None else [])
+            orig_te_devices = [next(t.parameters()).device for t in te_list]
+            self.sd.text_encoder_to(device)
+            embeds_list = [
+                self.sd.encode_prompt([prompt]).to('cpu', dtype=torch.float32).detach()
+                for prompt in prompt_list
+            ]
+            for t, te_device in zip(te_list, orig_te_devices):
+                t.to(te_device)
+
+            # seed so the vae latent dist sampling is always identical
+            torch.manual_seed(42)
+            orig_vae_device = self.sd.vae.device
+            latents = self.sd.encode_images(image_list, device=device, dtype=dtype)
+            self.sd.vae.to(orig_vae_device)
+
+            # fixed noise per image, seeds start at 42 and increment for each image
+            noise_list = []
+            for i in range(latents.shape[0]):
+                generator = torch.Generator(device='cpu').manual_seed(42 + i)
+                noise_list.append(
+                    torch.randn(latents[i:i + 1].shape, generator=generator, dtype=torch.float32)
+                )
+            noise = torch.cat(noise_list, dim=0)
+
+        self._validation_cache = {
+            'latents': latents.to('cpu', dtype=torch.float32),
+            'noise': noise,
+            'embeds': embeds_list,
+        }
+        flush()
+
+    def validate(self):
+        val_config = self.train_config.validation_config
+        if val_config is None or self._validation_cache is None:
+            return
+        if not self.accelerator.is_main_process:
+            return
+        device = self.device_torch
+        dtype = get_torch_dtype(self.train_config.dtype)
+        sigmas = val_config.validation_sigmas
+        cache = self._validation_cache
+
+        was_unet_training = self.sd.unet.training
+        self.sd.unet.eval()
+        # the network is only active inside its context, without this the base model is validated
+        network = self.network if self.network is not None else BlankNetwork()
+        start_multiplier = network.multiplier
+        network.multiplier = 1.0
+        with torch.no_grad(), network:
+            latents = cache['latents'].to(device, dtype=dtype)
+            noise = cache['noise'].to(device, dtype=dtype)
+            num_images = latents.shape[0]
+
+            # single batch of every (image, sigma) pair, ordered sigma major
+            batch_latents = torch.cat([latents] * len(sigmas), dim=0)
+            batch_noise = torch.cat([noise] * len(sigmas), dim=0)
+            batch_embeds = concat_prompt_embeds(
+                [e.clone().to(device, dtype=dtype) for e in cache['embeds']] * len(sigmas)
+            )
+
+            if self.sd.is_flow_matching:
+                timestep_values = [sigma * 1000.0 for sigma in sigmas]
+            else:
+                num_train_timesteps = self.sd.noise_scheduler.config.num_train_timesteps
+                timestep_values = [
+                    min(int(round(sigma * num_train_timesteps)), num_train_timesteps - 1)
+                    for sigma in sigmas
+                ]
+            timesteps = torch.tensor(
+                [t for t in timestep_values for _ in range(num_images)],
+                device=device,
+            )
+
+            noisy_latents = self.sd.add_noise(batch_latents, batch_noise, timesteps).detach()
+
+            noise_pred = self.sd.predict_noise(
+                latents=noisy_latents.to(device, dtype=dtype),
+                conditional_embeddings=batch_embeds,
+                timestep=timesteps,
+                guidance_scale=1.0,
+                guidance_embedding_scale=self.train_config.cfg_scale,
+                bypass_guidance_embedding=self.train_config.bypass_guidance_embedding,
+            )
+
+            if self.sd.is_flow_matching:
+                target = batch_noise - batch_latents
+            elif self.sd.prediction_type == 'v_prediction':
+                target = self.sd.noise_scheduler.get_velocity(batch_latents, batch_noise, timesteps)
+            else:
+                target = batch_noise
+
+            val_loss = torch.nn.functional.mse_loss(noise_pred.float(), target.float())
+            self.additional_logs['val/loss'] = val_loss.item()
+        network.multiplier = start_multiplier
+        if was_unet_training:
+            self.sd.unet.train()
 
     def run(self):
         # torch.autograd.set_detect_anomaly(True)
@@ -1581,7 +1736,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if self.is_fine_tuning or self.train_config.merge_network_on_save:
             # get the latest checkpoint
             # check to see if we have a latest save
-            latest_save_path = self.get_latest_save_path()
+            # exclude pretrained_lora_path here so a pretrained lora is not loaded as full model
+            # weights. It is loaded as the initial lora later when building the network.
+            latest_save_path = self.get_latest_save_path(include_pretrained_lora=False)
 
             if latest_save_path is not None:
                 print_acc(f"#### IMPORTANT RESUMING FROM {latest_save_path} ####")
@@ -1816,7 +1973,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     self.train_config.train_unet
                 )
 
-                # we cannot merge in if quantized
+                # we cannot merge in if quantized or offloading. note: torchao quantized weights can
+                # still be force merged at save time for the merge-and-reset method (see save logic),
+                # but we keep can_merge_in False here so sampling never merges in/out.
                 if self.model_config.quantize or self.model_config.layer_offloading:
                     # todo find a way around this
                     self.network.can_merge_in = False
@@ -1869,6 +2028,15 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     print_acc(f"Loading from {latest_save_path}")
                     extra_weights = self.load_weights(latest_save_path)
                     self.network.multiplier = 1.0
+                elif self.train_config.merge_network_on_save and self.network_config.pretrained_lora_path is not None:
+                    # with merge_network_on_save, saved checkpoints are full models that get loaded as the
+                    # base model. Only load the pretrained lora as the initial lora when we are not resuming
+                    # from a saved checkpoint (otherwise it is already merged into the loaded model).
+                    resume_save_path = self.get_latest_save_path(include_pretrained_lora=False)
+                    if resume_save_path is None and os.path.exists(self.network_config.pretrained_lora_path):
+                        print_acc(f"Loading initial lora from pretrained lora path: {self.network_config.pretrained_lora_path}")
+                        extra_weights = self.load_weights(self.network_config.pretrained_lora_path)
+                        self.network.multiplier = 1.0
                 
                 if self.network_config.layer_offloading:
                     MemoryManager.attach(
@@ -2033,6 +2201,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
             # Update the learning rates if they changed
             # optimizer.param_groups = previous_params
 
+        # set up the ema now that the optimizer (and its params) are ready
+        self.setup_ema()
+
         lr_scheduler_params = self.train_config.lr_scheduler_params
 
         # make sure it had bare minimum
@@ -2045,6 +2216,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
             **lr_scheduler_params
         )
         self.lr_scheduler = lr_scheduler
+
+        # cache validation latents and embeddings now, the vae and text encoder
+        # may be dumped before the train loop starts
+        self.setup_validation()
 
         ### HOOk ###
         self.before_dataset_load()
@@ -2060,16 +2235,215 @@ class BaseSDTrainProcess(BaseTrainProcess):
         ### HOOK ###
         self.hook_before_train_loop()
 
-        # compile the model if needed (must be after LoRA/adapter injection AND accelerator.prepare)
+        # ============================================================
+        # COMPILE
+        #
+        # compile: true
+        #     -> whole-model torch.compile
+        #
+        # compile: true
+        # block_compile: true
+        #     -> block-level compilation
+        # ============================================================
         if self.model_config.compile:
+            compiled_refs = []  # (block_list, index, original_block) for rollback on failure
             try:
-                # make sure it is on the gpu
-                self.sd.unet.to(self.device_torch)
-                print_acc("Compiling model with torch.compile. The first forward will hang for a while using this. This is normal.")
-                self.sd.unet = torch.compile(self.sd.unet)
+                inner_unet_check = unwrap_model(self.sd.unet)
+                is_unet_offloaded = hasattr(inner_unet_check, '_memory_manager')
+
+                text_encoder = getattr(self.sd, "text_encoder", None)
+                text_encoder_check = unwrap_model(text_encoder) if text_encoder is not None else None
+                is_te_offloaded = hasattr(text_encoder_check, '_memory_manager') if text_encoder_check is not None else False
+
+                is_unet_quantized = getattr(self.model_config, 'quantize', False)
+                is_quantized = is_unet_quantized or getattr(self.model_config, 'quantize_te', False)
+
+                if not is_unet_offloaded:
+                    self.sd.unet.to(self.device_torch)
+
+                cache_size_limit = getattr(self.model_config, 'cache_size_limit', None)
+                user_set_cache_limit = cache_size_limit is not None
+                if user_set_cache_limit:
+                    torch._dynamo.config.cache_size_limit = cache_size_limit
+                torch._dynamo.config.suppress_errors = False
+                # torch 2.9 inductor bug: the new memory-coalescing tiling analysis
+                # crashes on some dynamic-shape index expressions (sympy PowByNatural
+                # "assert p >= 0", seen with Qwen Image). The analysis doesn't apply
+                # to dynamic shapes anyway, so turn it off.
+                if hasattr(torch._inductor.config.triton, 'coalesce_tiling_analysis'):
+                    torch._inductor.config.triton.coalesce_tiling_analysis = False
+
+                compile_mode = getattr(self.model_config, 'compile_mode', 'default')
+                compile_dynamic = getattr(self.model_config, 'compile_dynamic', True)
+                compile_fullgraph = getattr(self.model_config, 'compile_fullgraph', False)
+                block_compile = getattr(self.model_config, 'block_compile', False)
+
+                # quantized + offloaded unet is incompatible with fullgraph; force it off
+                if is_unet_quantized and is_unet_offloaded and compile_fullgraph:
+                    print_acc(
+                        "Quantized offloaded Transformer detected: fullgraph=True is incompatible, "
+                        "switching to fullgraph=False."
+                    )
+                    compile_fullgraph = False
+
+                cache_info = ""
+                # ====================================================
+                # BLOCK COMPILE
+                # ====================================================
+                if block_compile:
+                    BLOCK_LIST_ATTRS = self.sd.get_transformer_block_names()
+
+                    if BLOCK_LIST_ATTRS is None or len(BLOCK_LIST_ATTRS) == 0:
+                        BLOCK_LIST_ATTRS = [
+                            'layers',
+                            'transformer_blocks',
+                            'single_transformer_blocks',
+                            'double_stream_blocks',
+                            'single_stream_blocks',
+                            'double_blocks',
+                            'single_blocks',
+                            'blocks',
+                        ]
+                    inner_unet = unwrap_model(self.sd.unet)
+
+                    compiled_block_count = 0
+
+                    for attr_name in BLOCK_LIST_ATTRS:
+                        # attr_name may be a dotted path for models that nest their
+                        # blocks (e.g. hidream_o1's "model.language_model.layers").
+                        block_list = inner_unet
+                        for part in attr_name.split('.'):
+                            block_list = getattr(block_list, part, None)
+                            if block_list is None:
+                                break
+
+                        if block_list is None:
+                            continue
+
+                        if not hasattr(block_list, '__len__'):
+                            continue
+
+                        for i, block in enumerate(block_list):
+                            if not isinstance(block, torch.nn.Module):
+                                continue
+
+                            if hasattr(block, '_hf_hook'):
+                                continue
+
+                            compiled_refs.append((block_list, i, block))
+                            block_list[i] = torch.compile(
+                                block,
+                                mode=compile_mode,
+                                dynamic=compile_dynamic,
+                                fullgraph=compile_fullgraph,
+                            )
+                            compiled_block_count += 1
+
+                    if compiled_block_count > 0:
+                        if user_set_cache_limit:
+                            auto_cache_limit = max(cache_size_limit, compiled_block_count * 2)
+                            if auto_cache_limit != cache_size_limit:
+                                torch._dynamo.config.cache_size_limit = auto_cache_limit
+                                cache_info = f", cache_size_limit={auto_cache_limit} (auto)"
+                            else:
+                                cache_info = f", cache_size_limit={cache_size_limit}"
+                        else:
+                            auto_cache_limit = compiled_block_count * 2
+                            torch._dynamo.config.cache_size_limit = auto_cache_limit
+                            cache_info = f", cache_size_limit={auto_cache_limit} (auto)"
+                        print_acc(
+                            f"Compiled {compiled_block_count} transformer block(s) "
+                            f"with torch.compile (mode='{compile_mode}', fullgraph={compile_fullgraph}, dynamic={compile_dynamic}{cache_info})."
+                        )
+                        print_acc("The first forward pass will be slow during compile. This is normal.")
+                        print_acc("If you are experiencing issues, disable block_compile.")
+                    else:
+                        print_acc(
+                            f"No individual transformer blocks found; "
+                            f"falling back to whole-model torch.compile "
+                            f"(mode='{compile_mode}', fullgraph={compile_fullgraph}, dynamic={compile_dynamic}{cache_info})."
+                        )
+                        print_acc("The first forward pass will hang for a while. This is normal.")
+
+                        if is_unet_quantized and not is_unet_offloaded and compile_fullgraph:
+                            print_acc(
+                                "Quantized model detected: fullgraph=True is incompatible "
+                                "for whole-model compile, switching to fullgraph=False."
+                            )
+                            compile_fullgraph = False
+
+                        if compile_mode == 'default':
+                            self.sd.unet = torch.compile(
+                                self.sd.unet,
+                                dynamic=compile_dynamic,
+                                fullgraph=compile_fullgraph,
+                            )
+                        else:
+                            self.sd.unet = torch.compile(
+                                self.sd.unet,
+                                mode=compile_mode,
+                                dynamic=compile_dynamic,
+                                fullgraph=compile_fullgraph,
+                            )
+
+                # ====================================================
+                # WHOLE MODEL COMPILE
+                # ====================================================
+                else:
+                    print_acc("Compiling model with torch.compile (whole-model compile).")
+                    print_acc("The first forward pass will hang for a while. This is normal.")
+
+                    print_acc(
+                        f"Using torch.compile settings: "
+                        f"mode={compile_mode}, "
+                        f"dynamic={compile_dynamic}, "
+                        f"fullgraph={compile_fullgraph}{cache_info}"
+                    )
+
+                    if compile_fullgraph:
+                        print_acc(
+                            "fullgraph=True is incompatible with whole-model compile, "
+                            "switching to fullgraph=False."
+                        )
+                        compile_fullgraph = False
+
+                    if compile_mode == 'default':
+                        self.sd.unet = torch.compile(
+                            self.sd.unet,
+                            dynamic=compile_dynamic,
+                            fullgraph=compile_fullgraph,
+                        )
+                    else:
+                        self.sd.unet = torch.compile(
+                            self.sd.unet,
+                            mode=compile_mode,
+                            dynamic=compile_dynamic,
+                            fullgraph=compile_fullgraph,
+                        )
+
+                if not is_unet_offloaded:
+                    # once compiled, dynamo guards hold weakrefs to the params;
+                    # .to() on quantized params requires swap_tensors, which fails
+                    # on tensors with weakrefs. The model stays on device anyway,
+                    # so make .to() a no-op.
+                    unet_module = self.sd.unet
+                    unet_module.to = lambda *args, **kwargs: unet_module
+
             except Exception as e:
-                print_acc(f"Failed to compile model: {e}")
-                print_acc("Continuing without compilation")
+                # undo any block-level compiles that happened before the failure,
+                # so "continuing without compilation" is actually true
+                if len(compiled_refs) > 0:
+                    for block_list, i, original_block in compiled_refs:
+                        block_list[i] = original_block
+
+                if 'triton' in str(e).lower():
+                    print_acc("WARNING: compile is disabled.")
+                    print_acc("Triton is not available or not working on this system.")
+                    print_acc("Install a working 'triton' package to use compile.")
+                    print_acc("Continuing without compilation.")
+                else:
+                    print_acc(f"Failed to compile model: {e}")
+                    print_acc("Continuing without compilation")
 
         if self.has_first_sample_requested and self.step_num <= 1 and not self.train_config.disable_sampling:
             print_acc("Generating first sample from first sample config")
@@ -2154,7 +2528,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 # todo improve this logic to send one of each through if we can buckets and batch size might be an issue
                 is_reg_step = False
                 is_save_step = self.save_config.save_every and self.step_num % self.save_config.save_every == 0
-                is_sample_step = self.sample_config.sample_every and self.step_num % self.sample_config.sample_every == 0
+                is_sample_step = (
+                    self.sample_config.sample_every
+                    and self.step_num >= self.sample_config.sample_start_step
+                    and self.step_num % self.sample_config.sample_every == 0
+                )
                 if self.train_config.disable_sampling:
                     is_sample_step = False
 
@@ -2258,6 +2636,18 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 print("\n==== Profile Results ====")
                 print(self.torch_profiler.key_averages().table(sort_by="cpu_time_total", row_limit=1000))
             self.timer.stop('train_loop')
+
+            # run validation before any possible sampling/logging for this step
+            if not did_oom and self.train_config.validation_config is not None:
+                val_config = self.train_config.validation_config
+                is_validate_step = (
+                    self.step_num == self.start_step
+                    or (val_config.validate_every_n_steps and self.step_num % val_config.validate_every_n_steps == 0)
+                )
+                if is_validate_step:
+                    with self.timer('validate'):
+                        self.validate()
+
             if not did_first_flush:
                 flush()
                 did_first_flush = True
@@ -2357,6 +2747,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                     self.logger.log({
                                         f'loss/{key}': value,
                                     })
+                            if self.additional_logs is not None:
+                                for key, value in self.additional_logs.items():
+                                    self.logger.log({
+                                        key: value,
+                                    })
+                                self.additional_logs = {}
                     elif self.logging_config.log_every is None:
                         if self.accelerator.is_main_process:
                             # log every step
@@ -2367,6 +2763,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                 self.logger.log({
                                     f'loss/{key}': value,
                                 })
+                            if self.additional_logs is not None:
+                                for key, value in self.additional_logs.items():
+                                    self.logger.log({
+                                        key: value,
+                                    })
+                                self.additional_logs = {}
 
 
                     if self.performance_log_every > 0 and self.step_num % self.performance_log_every == 0:
@@ -2405,13 +2807,15 @@ class BaseSDTrainProcess(BaseTrainProcess):
             self.progress_bar.close()
         if self.train_config.free_u:
             self.sd.pipeline.disable_freeu()
+        final_path = None
+        if self.accelerator.is_main_process:
+            final_path = self.save()
         if not self.train_config.disable_sampling:
             self.sample(self.step_num)
             self.logger.commit(step=self.step_num)
         print_acc("")
         if self.accelerator.is_main_process:
             try:
-                final_path = self.save()
                 # Register model (only for adapter training, not merged saves)
                 if (
                     final_path
